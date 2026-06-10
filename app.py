@@ -26,8 +26,8 @@ from scripts.visualization import (
     chart_top_units,
 )
 
-st.set_page_config(page_title="Breakdown Analytics Dashboard", layout="wide")
-st.title("Breakdown Analytics & Maintenance Dashboard")
+st.set_page_config(page_title="Dozer Breakdown Analytics Dashboard", layout="wide")
+st.title("Dozer Breakdown Analytics & Maintenance Dashboard")
 st.caption("Interactive dashboard for heavy equipment breakdown monitoring")
 
 data_folder = Path(__file__).parent / "data" / "raw"
