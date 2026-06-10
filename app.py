@@ -1,0 +1,489 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+from scripts.analytics import compute_kpis
+from scripts.classify import add_classification_columns
+from scripts.cleaning import clean_and_transform, load_raw_data
+from scripts.readiness import (
+    build_hourly_readiness,
+    load_or_create_readiness_plan,
+    summarize_daily_readiness,
+    summarize_hourly_readiness,
+)
+from scripts.visualization import (
+    chart_by_location,
+    chart_daily_trend,
+    chart_heatmap,
+    chart_pareto_category,
+    chart_timeline,
+    chart_timeline_subcategory,
+    chart_top_units,
+)
+
+st.set_page_config(page_title="Breakdown Analytics Dashboard", layout="wide")
+st.title("Breakdown Analytics & Maintenance Dashboard")
+st.caption("Interactive dashboard for heavy equipment breakdown monitoring")
+
+data_folder = Path(__file__).parent / "data" / "raw"
+plan_file = Path(__file__).parent / "data" / "master" / "dozer_readiness_plan.xlsx"
+df_raw = load_raw_data(data_folder)
+
+if df_raw.empty:
+    st.info("No Excel files found in data/raw. Please add files first.")
+    st.stop()
+
+df_clean = clean_and_transform(df_raw)
+df = add_classification_columns(df_clean)
+readiness_plan = load_or_create_readiness_plan(plan_file, df["Date"], default_plan_units=14)
+
+st.sidebar.header("Filters")
+date_values = pd.to_datetime(df["Date"], errors="coerce").dropna()
+if date_values.empty:
+    date_min = pd.Timestamp.today().date()
+    date_max = pd.Timestamp.today().date()
+else:
+    date_min = date_values.min().date()
+    date_max = date_values.max().date()
+
+date_range = st.sidebar.date_input("Date Range", value=(date_min, date_max))
+model_opt = st.sidebar.multiselect("Model", sorted(df["Model"].dropna().astype(str).unique()))
+unit_opt = st.sidebar.multiselect("Unit", sorted(df["CN Unit"].dropna().astype(str).unique()))
+shift_opt = st.sidebar.multiselect("Shift", sorted(df["Shift"].dropna().astype(str).unique()))
+loc_opt = st.sidebar.multiselect("Location", sorted(df["Location"].dropna().astype(str).unique()))
+cat_opt = st.sidebar.multiselect("Category", sorted(df["Category"].dropna().astype(str).unique()))
+if cat_opt:
+    subcat_pool = (
+        df[df["Category"].astype(str).isin(cat_opt)]["Subcategory"].dropna().astype(str).unique()
+    )
+else:
+    subcat_pool = df["Subcategory"].dropna().astype(str).unique()
+subcat_opt = st.sidebar.multiselect("Subcategory", sorted(subcat_pool))
+sev_opt = st.sidebar.multiselect("Severity", sorted(df["Severity"].dropna().astype(str).unique()))
+valid_opt = st.sidebar.multiselect(
+    "Duration Check", sorted(df["Duration_Check"].dropna().astype(str).unique())
+)
+st.sidebar.markdown("### Hour Filters")
+first_hours_mode = st.sidebar.checkbox("Filter N First Hours per Shift")
+first_hours_n = st.sidebar.selectbox("N First Hours", options=[2, 3, 4, 6], index=0)
+last_hours_mode = st.sidebar.checkbox("Filter N Last Hours per Shift")
+last_hours_n = st.sidebar.selectbox("N Last Hours", options=[2, 3, 4, 6], index=0)
+
+filtered = df.copy()
+if len(date_range) == 2:
+    start_date, end_date = date_range
+    filtered = filtered[
+        (pd.to_datetime(filtered["Date"], errors="coerce").dt.date >= start_date)
+        & (pd.to_datetime(filtered["Date"], errors="coerce").dt.date <= end_date)
+    ]
+if model_opt:
+    filtered = filtered[filtered["Model"].astype(str).isin(model_opt)]
+if unit_opt:
+    filtered = filtered[filtered["CN Unit"].astype(str).isin(unit_opt)]
+if shift_opt:
+    filtered = filtered[filtered["Shift"].astype(str).isin(shift_opt)]
+if loc_opt:
+    filtered = filtered[filtered["Location"].astype(str).isin(loc_opt)]
+if cat_opt:
+    filtered = filtered[filtered["Category"].astype(str).isin(cat_opt)]
+if subcat_opt:
+    filtered = filtered[filtered["Subcategory"].astype(str).isin(subcat_opt)]
+if sev_opt:
+    filtered = filtered[filtered["Severity"].astype(str).isin(sev_opt)]
+if valid_opt:
+    filtered = filtered[filtered["Duration_Check"].astype(str).isin(valid_opt)]
+
+if first_hours_mode:
+    shift_start_map = {
+        "SHIFT 1": 6,
+        "SHIFT 2": 18,
+        "SHIFT 3": 0,
+    }
+    shift_norm = filtered["Shift"].astype("string").str.upper().str.strip()
+    shift_start = shift_norm.map(shift_start_map)
+    hour_start = pd.to_numeric(filtered["Hour_Start"], errors="coerce")
+    hour_from_shift = (hour_start - shift_start) % 24
+    filtered = filtered[hour_from_shift.between(0, first_hours_n - 1, inclusive="both")]
+
+if last_hours_mode:
+    shift_start_map = {
+        "SHIFT 1": 6,
+        "SHIFT 2": 18,
+        "SHIFT 3": 0,
+    }
+    shift_norm = filtered["Shift"].astype("string").str.upper().str.strip()
+    shift_start = shift_norm.map(shift_start_map)
+    hour_start = pd.to_numeric(filtered["Hour_Start"], errors="coerce")
+    hour_from_shift = (hour_start - shift_start) % 24
+    filtered = filtered[hour_from_shift.between(12 - last_hours_n, 11, inclusive="both")]
+
+st.sidebar.markdown("---")
+st.sidebar.caption(f"Raw rows: {len(df):,}")
+st.sidebar.caption(f"Filtered rows: {len(filtered):,}")
+
+if filtered.empty:
+    st.warning("No data matches current filters. Please adjust filter values.")
+    st.stop()
+
+kpi = compute_kpis(filtered)
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1.metric("Total BD", f"{kpi['total_breakdown_count']:,}")
+c2.metric("Total Hours", f"{kpi['total_downtime_hours']:.2f}")
+c3.metric("Avg Repair (h)", f"{kpi['average_repair_duration']:.2f}")  # MTTR proxy
+c4.metric("Top Unit", kpi["top_problematic_unit"])
+c5.metric("Top Category", kpi["top_breakdown_category"])
+
+days_covered = max(
+    1,
+    (
+        pd.to_datetime(filtered["Date"], errors="coerce").max()
+        - pd.to_datetime(filtered["Date"], errors="coerce").min()
+    ).days
+    + 1,
+)
+daily_bd_rate = len(filtered) / days_covered
+mtbf_days = 1 / daily_bd_rate if daily_bd_rate > 0 else 0
+availability_est = max(
+    0.0, 100 - (float(kpi["total_downtime_hours"]) / (days_covered * 24) * 100)
+)
+c6.metric("Est. Availability", f"{availability_est:.1f}%")
+
+st.caption(f"Estimated MTBF: {mtbf_days:.2f} days/failure across filtered range")
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "Pattern", "Unit Detail", "Unit Readiness", "Detail"])
+
+with tab1:
+    st.plotly_chart(chart_pareto_category(filtered), use_container_width=True)
+    subcat_all = (
+        filtered.groupby("Subcategory", dropna=False)["Duration_Real"]
+        .sum()
+        .sort_values(ascending=False)
+        .reset_index()
+    )
+    fig_subcat_all = px.bar(
+        subcat_all,
+        x="Subcategory",
+        y="Duration_Real",
+        title="Pareto Breakdown by Subcategory",
+    )
+    st.plotly_chart(fig_subcat_all, use_container_width=True)
+
+    st.markdown("### Category to Subcategory Drilldown")
+    available_categories = sorted(filtered["Category"].dropna().astype(str).unique())
+    drill_category = st.selectbox("Select Category", options=available_categories)
+    drill_df = filtered[filtered["Category"].astype(str) == drill_category]
+    drill_subcat = (
+        drill_df.groupby("Subcategory", dropna=False)["Duration_Real"]
+        .sum()
+        .sort_values(ascending=False)
+        .reset_index()
+    )
+    fig_drill = px.bar(
+        drill_subcat,
+        x="Subcategory",
+        y="Duration_Real",
+        title=f"Subcategory Detail - {drill_category}",
+    )
+    st.plotly_chart(fig_drill, use_container_width=True)
+
+    st.plotly_chart(chart_daily_trend(filtered), use_container_width=True)
+    a, b = st.columns(2)
+    with a:
+        st.plotly_chart(chart_top_units(filtered), use_container_width=True)
+    with b:
+        st.plotly_chart(chart_by_location(filtered), use_container_width=True)
+
+with tab2:
+    st.plotly_chart(chart_heatmap(filtered), use_container_width=True)
+    st.plotly_chart(chart_timeline(filtered), use_container_width=True)
+    st.plotly_chart(chart_timeline_subcategory(filtered), use_container_width=True)
+
+with tab3:
+    st.markdown("### Unit Detail Filters")
+    unit_list_detail = sorted(filtered["CN Unit"].dropna().astype(str).unique())
+    selected_units_detail = st.multiselect(
+        "Select Unit(s) for Detail",
+        options=unit_list_detail,
+        default=unit_list_detail,
+    )
+    if selected_units_detail:
+        unit_filtered = filtered[filtered["CN Unit"].astype(str).isin(selected_units_detail)].copy()
+    else:
+        unit_filtered = filtered.copy()
+
+    unit_cat_filter = st.multiselect(
+        "Filter Category (Unit Detail)",
+        options=sorted(unit_filtered["Category"].dropna().astype(str).unique()),
+    )
+    if unit_cat_filter:
+        unit_filtered = unit_filtered[unit_filtered["Category"].astype(str).isin(unit_cat_filter)]
+
+    unit_subcat_filter = st.multiselect(
+        "Filter Subcategory (Unit Detail)",
+        options=sorted(unit_filtered["Subcategory"].dropna().astype(str).unique()),
+    )
+    if unit_subcat_filter:
+        unit_filtered = unit_filtered[unit_filtered["Subcategory"].astype(str).isin(unit_subcat_filter)]
+
+    if unit_filtered.empty:
+        st.warning("No unit detail data for selected filters.")
+    else:
+        unit_agg = (
+            unit_filtered.groupby("CN Unit", dropna=False)
+            .agg(
+                Breakdown_Count=("CN Unit", "count"),
+                Total_Downtime=("Duration_Real", "sum"),
+                Avg_Duration=("Duration_Real", "mean"),
+            )
+            .reset_index()
+            .sort_values(["Total_Downtime", "Breakdown_Count"], ascending=[False, False])
+        )
+        fig_all_units = px.bar(
+            unit_agg,
+            x="CN Unit",
+            y="Total_Downtime",
+            hover_data=["Breakdown_Count", "Avg_Duration"],
+            title="All Units - Total Downtime",
+        )
+        st.plotly_chart(fig_all_units, use_container_width=True)
+        st.dataframe(unit_agg, use_container_width=True, height=360)
+
+        u1, u2 = st.columns(2)
+        with u1:
+            cat_by_unit = (
+                unit_filtered.groupby("Category", dropna=False)["Duration_Real"]
+                .sum()
+                .sort_values(ascending=False)
+                .reset_index()
+            )
+            fig_unit_cat = px.bar(
+                cat_by_unit,
+                x="Category",
+                y="Duration_Real",
+                title="Unit Detail - Category Downtime",
+            )
+            st.plotly_chart(fig_unit_cat, use_container_width=True)
+        with u2:
+            subcat_by_unit = (
+                unit_filtered.groupby("Subcategory", dropna=False)["Duration_Real"]
+                .sum()
+                .sort_values(ascending=False)
+                .reset_index()
+            )
+            fig_unit_subcat = px.bar(
+                subcat_by_unit,
+                x="Subcategory",
+                y="Duration_Real",
+                title="Unit Detail - Subcategory Downtime",
+            )
+            st.plotly_chart(fig_unit_subcat, use_container_width=True)
+
+        st.markdown("### Unit Problem Matrix (Category + Subcategory)")
+        unit_matrix = (
+            unit_filtered.groupby(["CN Unit", "Category", "Subcategory"], dropna=False)
+            .agg(Breakdown_Count=("CN Unit", "count"), Total_Downtime=("Duration_Real", "sum"))
+            .reset_index()
+            .sort_values(["CN Unit", "Total_Downtime"], ascending=[True, False])
+        )
+        st.dataframe(unit_matrix, use_container_width=True, height=420)
+
+with tab4:
+    st.markdown("### Unit Readiness")
+    r1, r2, r3 = st.columns([1, 1, 2])
+    with r1:
+        ready_threshold = st.number_input(
+            "Ready threshold minutes/hour",
+            min_value=1,
+            max_value=60,
+            value=30,
+            step=1,
+        )
+    with r2:
+        readiness_shift_view = st.selectbox("Hourly shift view", ["All", "Shift 1", "Shift 2"])
+    with r3:
+        if readiness_shift_view == "Shift 1":
+            slot_hours = list(range(6, 18))
+        elif readiness_shift_view == "Shift 2":
+            slot_hours = list(range(18, 24)) + list(range(0, 6))
+        else:
+            slot_hours = list(range(6, 24)) + list(range(0, 6))
+
+        slot_labels = {hour: f"{hour:02d}-{(hour + 1) % 24:02d}" for hour in slot_hours}
+        selected_slot_labels = st.multiselect(
+            "Hourly slots",
+            options=list(slot_labels.values()),
+            default=list(slot_labels.values()),
+        )
+        selected_slot_hours = [
+            hour for hour, label in slot_labels.items() if label in selected_slot_labels
+        ]
+
+    readiness_units = sorted(
+        (unit_opt if unit_opt else df["CN Unit"].dropna().astype(str).unique())
+    )
+    selected_readiness_dates = pd.to_datetime(filtered["Date"], errors="coerce").dt.date.dropna().unique()
+    readiness_plan_filtered = readiness_plan[readiness_plan["Date"].isin(selected_readiness_dates)].copy()
+    hourly_readiness = build_hourly_readiness(
+        filtered,
+        readiness_plan_filtered,
+        ready_threshold_minutes=int(ready_threshold),
+        units=readiness_units,
+    )
+
+    if hourly_readiness.empty:
+        st.warning("No readiness data available for current filters.")
+    else:
+        hourly_summary = summarize_hourly_readiness(hourly_readiness)
+        daily_summary = summarize_daily_readiness(hourly_summary)
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Plan Ready Units", f"{daily_summary['Plan_Ready_Units'].max():.0f}")
+        k2.metric("Avg Actual Ready", f"{daily_summary['Actual_Ready_Units'].mean().round():.0f}")
+        k3.metric("Min Actual Ready", f"{daily_summary['Min_Ready_Units'].min():.0f}")
+        k4.metric("Avg Achievement", f"{daily_summary['Ready_Achievement_%'].mean():.1f}%")
+        st.caption(
+            f"Raw average actual ready: {daily_summary['Actual_Ready_Units'].mean():.2f} units "
+            f"(achievement is calculated from this raw value)."
+        )
+
+        fig_daily_readiness = go.Figure()
+        fig_daily_readiness.add_bar(
+            x=daily_summary["Date"],
+            y=daily_summary["Actual_Ready_Units_Rounded"],
+            name="Actual Ready Units",
+        )
+        fig_daily_readiness.add_scatter(
+            x=daily_summary["Date"],
+            y=daily_summary["Plan_Ready_Units"],
+            name="Plan Ready Units",
+            mode="lines+markers",
+        )
+        fig_daily_readiness.update_layout(
+            title="Daily Unit Readiness: Actual vs Plan",
+            xaxis_title="Date",
+            yaxis_title="Units",
+            barmode="overlay",
+        )
+        st.plotly_chart(fig_daily_readiness, use_container_width=True)
+
+        st.markdown("### Hourly Readiness")
+        hourly_dates = sorted(hourly_summary["Date"].dropna().unique())
+        selected_hourly_dates = st.multiselect(
+            "Hourly date filter",
+            options=hourly_dates,
+            default=hourly_dates,
+        )
+        hourly_summary_filtered = hourly_summary[
+            hourly_summary["Hour"].isin(selected_slot_hours)
+            & hourly_summary["Date"].isin(selected_hourly_dates)
+        ].copy()
+        hourly_readiness_filtered = hourly_readiness[
+            hourly_readiness["Hour"].isin(selected_slot_hours)
+            & hourly_readiness["Date"].isin(selected_hourly_dates)
+        ].copy()
+
+        hourly_summary_filtered["Actual_Ready_Units_Rounded"] = (
+            hourly_summary_filtered["Actual_Ready_Units"].round().astype("Int64")
+        )
+        hourly_summary_filtered["Hour_Slot"] = hourly_summary_filtered["Hour"].map(
+            lambda hour: f"{int(hour):02d}-{(int(hour) + 1) % 24:02d}"
+        )
+        hourly_by_slot = (
+            hourly_summary_filtered.groupby(["Hour", "Hour_Slot"], dropna=False)
+            .agg(
+                Actual_Ready_Units=("Actual_Ready_Units", "mean"),
+                Plan_Ready_Units=("Plan_Ready_Units", "max"),
+            )
+            .reset_index()
+        )
+        hourly_by_slot["Actual_Ready_Units_Rounded"] = (
+            hourly_by_slot["Actual_Ready_Units"].round().astype("Int64")
+        )
+        hourly_by_slot["Hour_Order"] = hourly_by_slot["Hour"].map(
+            lambda hour: selected_slot_hours.index(hour) if hour in selected_slot_hours else 999
+        )
+        hourly_by_slot = hourly_by_slot.sort_values("Hour_Order")
+
+        fig_hourly_readiness = go.Figure()
+        fig_hourly_readiness.add_bar(
+            x=hourly_by_slot["Hour_Slot"],
+            y=hourly_by_slot["Actual_Ready_Units_Rounded"],
+            name="Actual Ready Units",
+            customdata=hourly_by_slot[["Actual_Ready_Units"]],
+            hovertemplate="Slot=%{x}<br>Actual Rounded=%{y}<br>Actual Raw=%{customdata[0]:.2f}<extra></extra>",
+        )
+        fig_hourly_readiness.add_scatter(
+            x=hourly_by_slot["Hour_Slot"],
+            y=hourly_by_slot["Plan_Ready_Units"],
+            name="Plan Ready Units",
+            mode="lines+markers",
+        )
+        fig_hourly_readiness.update_layout(
+            title="Hourly Unit Readiness by Hour Slot: Actual vs Plan",
+            xaxis_title="Hour Slot",
+            yaxis_title="Units",
+            barmode="overlay",
+            bargap=0.25,
+            xaxis={"type": "category", "tickangle": -25},
+            legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
+        )
+        st.plotly_chart(fig_hourly_readiness, use_container_width=True)
+
+        unit_readiness = (
+            hourly_readiness_filtered.groupby("CN Unit", dropna=False)
+            .agg(
+                Ready_Hours=("Is_Ready", "sum"),
+                Breakdown_Hours=("Is_Ready", lambda s: int((~s).sum())),
+                Total_Downtime_Minutes=("Downtime_Minutes", "sum"),
+                Avg_Ready_Minutes=("Ready_Minutes", "mean"),
+            )
+            .reset_index()
+            .sort_values(["Breakdown_Hours", "Total_Downtime_Minutes"], ascending=[False, False])
+        )
+        fig_unit_readiness = px.bar(
+            unit_readiness,
+            x="CN Unit",
+            y="Breakdown_Hours",
+            hover_data=["Total_Downtime_Minutes", "Avg_Ready_Minutes", "Ready_Hours"],
+            title="Pareto Unit Breakdown Hours",
+        )
+        st.plotly_chart(fig_unit_readiness, use_container_width=True)
+
+        st.dataframe(daily_summary, use_container_width=True, height=260)
+        st.dataframe(unit_readiness, use_container_width=True, height=360)
+
+with tab5:
+    view_cols = [
+        "Date",
+        "Model",
+        "CN Unit",
+        "Description of Breakdown",
+        "Awal",
+        "Akhir",
+        "Category",
+        "Subcategory",
+        "Severity",
+        "Shift",
+        "Location",
+        "Hours",
+        "Duration_Real",
+        "Duration_Check",
+        "PIC Breakdown",
+    ]
+    available_cols = [c for c in view_cols if c in filtered.columns]
+    st.dataframe(
+        filtered[available_cols].sort_values(by="Date", ascending=False),
+        use_container_width=True,
+        height=520,
+    )
+    st.download_button(
+        label="Download Filtered CSV",
+        data=filtered.to_csv(index=False).encode("utf-8"),
+        file_name="breakdown_filtered.csv",
+        mime="text/csv",
+    )
